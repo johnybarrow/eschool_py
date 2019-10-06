@@ -1,0 +1,172 @@
+import hashlib
+import json
+import time
+from threading import Thread, Lock
+
+import requests
+
+PERIOD = '145625'
+
+
+class EschoolClient:
+    def __init__(self, login=None, password=None):
+        self.session = requests.Session()
+        if login is None:
+            try:
+                with open(f'files/data_file.json') as f:
+                    login = json.load(f)['main']
+            except KeyError:
+                raise KeyError('Нет основного логина')
+        if password is None:
+            with open(f'files/data_file.json') as f:
+                password = json.load(f)[login]['password']
+
+        self.login = login
+        password = hashlib.sha256(password.encode()).hexdigest() or password
+        self.password = password
+        status = self.session.post('https://app.eschool.center/ec-server/login',
+                                   data={'username': login, 'password': password})
+        if status.status_code != 200:
+            raise NameError(f'Invalid login or password. Error: {status.status_code}')
+        try:
+            self.user_id = self.session.get('https://app.eschool.center/ec-server/student/diary').json()['user'][0]['id']
+        except json.decoder.JSONDecodeError:
+            raise NameError('Пользователь не имеет электронного дневника')
+        self.period = PERIOD
+        self.units = {unit['unitId']: unit['unitName'] for unit in self.__get('getDiaryUnits')['result']}
+        self.work_for_home = None
+        Thread(target=self.__handling).start()
+
+        try:
+            with open(f'files/data_file.json') as f:
+                all_file = json.load(f)
+                x = all_file[self.login]
+        except FileNotFoundError:
+            with open(f'files/data_file.json', 'w') as f:
+                json.dump({'main': login, self.login: {"password": password, "made_work_id": {}, "last_work_id": {}}}, f)
+        except KeyError:
+            with open(f'files/data_file.json', 'w') as f:
+                all_file[login] = {"password": password, "made_work_id": {}, "last_work_id": {}}
+                json.dump(all_file, f)
+
+    def __get(self, method, **kwargs):
+        resp = self.session.get(f'https://app.eschool.center/ec-server/{kwargs.get("prefix", "student")}/{method}/?userId={self.user_id}&eiId='
+                                f'{self.period}' + ('&' if kwargs else '') + '&'.join(
+            [key + '=' + str(kwargs[key]) for key in kwargs.keys() if key != 'prefix']))
+        if resp.status_code in [401, 400]:
+            self.session.post('https://app.eschool.center/ec-server/login',
+                              data={'username': self.login, 'password': self.password})
+            return self.__get(method, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    def __diary_units(self):
+        return self.__get('getDiaryUnits')
+
+    def get_marks(self):
+        result = self.__get('getDiaryPeriod')['result']
+        return [[lesson['markVal'], lesson['mktWt'], lesson['startDt'], lesson['lessonId'], lesson['lptName'],
+                 self.units[lesson['unitId']]]
+                for lesson in result if lesson.get('markVal')]
+
+    def __diary(self, d1, d2):
+        return self.__get('diary', d1=((d1 and int(d1)) or int(time.time())) * 1000,
+                          d2=((d2 and int(d2)) or (int(time.time()) + 14 * 24 * 3600)) * 1000)['lesson']
+
+    def homeworks(self, date_from=None, date_to=None):
+        if date_from is not None:
+            day, month, year = date_from
+            date_from = int(time.mktime((year, month, day, 0, 0, 0, 1, 48, 0)))
+        if date_to is not None:
+            day, month, year = date_to
+            date_to = int(time.mktime((year, month, day, 0, 0, 0, 1, 48, 0)))
+
+        result = []
+        for lesson in self.__diary(d1=date_from, d2=date_to):
+            part = list(filter(lambda part: len(part['variant']), lesson.get('part')))
+            if not part:
+                continue
+            part = part[0]
+            if not (part['variant'][0].get('text') or part['variant'][0].get('file')):
+                continue
+            result.append([part['variant'][0]['id'], lesson['unit']['name'], lesson['date'],
+                           part['variant'][0].get('text'),
+                           [[file['id'], file['fileName']] for file in part['variant'][0]['file']]])
+        return result
+
+    def get_homeworks(self, date_from=0, date_to=float('inf')):
+        if date_to == float('inf') and date_from != 0:  # Если дана лишь одна дата
+            day, month, year = date_from
+            date_from = int(time.mktime((year, month, day, 0, 0, 0, 1, 48, 0)))
+            return list(filter(lambda x: date_from == x[2] // 1000, self.work_for_home))
+
+        if date_from != 0 and date_to != float('inf'):  # Если даны обе даты
+            day, month, year = date_from
+            date_from = int(time.mktime((year, month, day, 0, 0, 0, 1, 48, 0)))
+            day, month, year = date_to
+            date_to = int(time.mktime((year, month, day, 0, 0, 0, 1, 48, 0)))
+
+        return list(filter(lambda x: date_from <= x[2] // 1000 <= date_to, self.work_for_home))
+
+    def chats(self):
+        return self.__get('threads', prefix='chat', newOnly='false', row=1, rowsCount=250)
+
+    def messages(self, threadId):
+        return self.__get('messages', prefix='chat', getNew='false', isSearch='false', rowStart=1, rowsCount=3,
+                          threadId=threadId)
+
+    def chat_members(self, threadId):
+        return self.__get('mem_and_cnt', prefix='chat', threadId=threadId)['members']
+
+    def get_groups(self):
+        return self.__get('olist', prefix='usr')
+
+    def download_file(self, file_id):
+        result = self.session.get(f'https://app.eschool.center/ec-server/files/{file_id}')
+        return result.content
+
+    def __get_smth(self, var, rewrite):
+        with open('files/data_file.json') as f:  # Читаем файл
+            all_file = json.load(f)
+            last_work = all_file[self.login][var]
+
+        # Перезапишем файл ...
+        if rewrite:  # для get_new_homework это id всех дз на 14 дней
+            new_var = [homework[0] for homework in self.work_for_home]
+        else:  # для get_not_made_work это все старые сделанные id, если они не старые (тогда удаляем)
+            new_var = list(filter(lambda x: x in [i[0] for i in self.work_for_home], last_work))
+
+        all_file[self.login][var] = new_var  # Перезапишем файл
+        with open('files/data_file.json', 'w') as f:
+            json.dump(all_file, f)
+
+        # Ответ - список всех дз на 14 дней, если его id нет в сделанных/прошлых id (возвращаем не сделанные/новые)
+        ans = [work for work in self.work_for_home if work[0] not in last_work]
+        return ans
+
+    def get_not_made_work(self):
+        return self.__get_smth(var='made_work_id', rewrite=False)
+
+    def get_new_homework(self):
+        return self.__get_smth(var='last_work_id', rewrite=True)
+
+    def redact_id_made_work(self, id, type_redact=''):  # Добавить id сделанного дз
+        with open('files/data_file.json') as f:  # Читаем файл
+            all_file = json.load(f)
+            write_file = all_file[self.login]['made_work_id']
+
+        if type_redact == 'del':
+            write_file = set(filter(lambda x: x not in id, write_file))
+        else:
+            write_file.extend(id)
+
+        all_file[self.login]['made_work_id'] = write_file  # Перезапишем файл
+        with open('files/data_file.json', 'w') as f:
+            json.dump(all_file, f)
+
+    def __handling(self):
+        mutex = Lock()
+        while True:
+            with mutex:
+                self.work_for_home = self.homeworks()
+            time.sleep(5 * 60)
