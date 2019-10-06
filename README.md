@@ -48,7 +48,12 @@ def process_homework(hw):
 
 ### Installing
 
-
+For Linux:
 ```bash
-sudo pip3 install eschool
+sudo pip3 install eschool_lib
+```
+
+For Windows:
+```bash
+pip install eschool_lib
 ```
